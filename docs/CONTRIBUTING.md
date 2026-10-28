@@ -33,7 +33,7 @@ Please make sure both pass before opening a PR.
 
 ## Architecture
 
-Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) first — the short version:
+Read [ARCHITECTURE.md](ARCHITECTURE.md) first — the short version:
 
 - The OpenClaw gateway (Node.js) runs on-device as `libnode.so` via
   `ProcessBuilder`. The app talks to it over WebSocket JSON-RPC on

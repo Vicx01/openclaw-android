@@ -136,7 +136,7 @@ The issue board is a quest board — pick your difficulty:
 | [📱 no-code](../../labels/%F0%9F%93%B1%20no-code) | Device testing, docs, demo GIFs — no Kotlin needed |
 
 Every merged PR gets you credited in the release notes; regulars land on the
-contributors wall below. Start with [CONTRIBUTING.md](CONTRIBUTING.md).
+contributors wall below. Start with [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
 
 <a href="../../graphs/contributors">
   <img src="https://contrib.rocks/image?repo=8crsk/openclaw-android" alt="Contributors" />
@@ -161,7 +161,7 @@ contributors wall below. Start with [CONTRIBUTING.md](CONTRIBUTING.md).
 - **Human-in-the-loop.** Risky actions (money, messages, deletion, installs)
   always prompt for approval and are audit-logged on device.
 
-See [SECURITY.md](SECURITY.md) for the full threat model and how to report
+See [docs/SECURITY.md](docs/SECURITY.md) for the full threat model and how to report
 vulnerabilities.
 
 ## 🙏 Credits
