@@ -78,6 +78,29 @@ class AppPreferences @Inject constructor(
         keysVersion.value += 1
     }
 
+    private val customEndpointsPrefs by lazy {
+        context.getSharedPreferences("openclaw_provider_endpoints", Context.MODE_PRIVATE)
+    }
+
+    fun getCustomBaseUrl(providerId: String): String =
+        customEndpointsPrefs.getString("base_url_$providerId", "")?.trim().orEmpty()
+
+    fun setCustomBaseUrl(providerId: String, url: String) {
+        val normalized = url.trim().trimEnd('/')
+        customEndpointsPrefs.edit().putString("base_url_$providerId", normalized).apply()
+        keysVersion.value += 1
+    }
+
+    fun getEffectiveBaseUrl(provider: com.crsk.openclaw.data.providers.AiProvider): String =
+        getCustomBaseUrl(provider.id).ifBlank { provider.baseUrl }
+
+    fun getCustomModel(providerId: String): String =
+        customEndpointsPrefs.getString("custom_model_$providerId", "")?.trim().orEmpty()
+
+    fun setCustomModel(providerId: String, modelId: String) {
+        customEndpointsPrefs.edit().putString("custom_model_$providerId", modelId.trim()).apply()
+    }
+
     /** Bare model id (as sent to the provider API) for the selected provider. */
     val selectedModel: StateFlow<String> = context.dataStore.data
         .map { it[selectedModelKey] ?: ProviderCatalog.default.defaultModel.id }
@@ -169,5 +192,10 @@ class AppPreferences @Inject constructor(
             it[lifetimeInputTokensKey] = 0L
             it[lifetimeOutputTokensKey] = 0L
         }
+    }
+
+    fun clearCustomEndpoints() {
+        runCatching { customEndpointsPrefs.edit().clear().apply() }
+        keysVersion.value += 1
     }
 }

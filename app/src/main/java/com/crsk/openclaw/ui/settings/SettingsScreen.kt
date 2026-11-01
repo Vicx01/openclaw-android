@@ -90,6 +90,8 @@ fun SettingsScreen(
     val savedKey by viewModel.savedKey.collectAsStateWithLifecycle()
     val selectedProvider by viewModel.selectedProvider.collectAsStateWithLifecycle()
     val selectedModel by viewModel.selectedModel.collectAsStateWithLifecycle()
+    val customBaseUrl by viewModel.customBaseUrl.collectAsStateWithLifecycle()
+    val customModelDraft by viewModel.customModelDraft.collectAsStateWithLifecycle()
     val keyEdit by viewModel.keyEdit.collectAsStateWithLifecycle()
     val gatewayStatus by viewModel.gatewayStatus.collectAsStateWithLifecycle()
     val autoStart by viewModel.autoStartOnBoot.collectAsStateWithLifecycle()
@@ -505,6 +507,23 @@ fun SettingsScreen(
                             unfocusedContainerColor = SurfaceGlass,
                         ),
                     )
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = customBaseUrl,
+                        onValueChange = viewModel::customBaseUrlChanged,
+                        label = { Text("Custom endpoint URL (optional)", color = TextSecondary) },
+                        placeholder = { Text(selectedProvider.baseUrl, color = TextMuted) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Cyan,
+                            unfocusedBorderColor = Color.White.copy(alpha = 0.10f),
+                            cursorColor = Cyan,
+                            focusedContainerColor = SurfaceGlass,
+                            unfocusedContainerColor = SurfaceGlass,
+                        ),
+                    )
                     keyEdit.message?.let { msg ->
                         Spacer(Modifier.height(6.dp))
                         Text(
@@ -519,6 +538,30 @@ fun SettingsScreen(
                         onClick = viewModel::saveKey,
                         enabled = !keyEdit.isValidating && keyEdit.draft.isNotBlank() && keyEdit.draft != savedKey,
                     )
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        TextButton(
+                            onClick = viewModel::testConnection,
+                            enabled = !keyEdit.isValidating && (keyEdit.draft.isNotBlank() || savedKey.isNotBlank()),
+                        ) {
+                            Text(
+                                text = "Test connection",
+                                color = if (!keyEdit.isValidating && (keyEdit.draft.isNotBlank() || savedKey.isNotBlank())) Cyan else TextMuted,
+                            )
+                        }
+                        if (customBaseUrl.isNotBlank()) {
+                            TextButton(
+                                onClick = viewModel::saveCustomBaseUrl,
+                                enabled = !keyEdit.isValidating,
+                            ) {
+                                Text("Save endpoint", color = Cyan)
+                            }
+                        }
+                    }
                     if (keyEdit.isValidating) {
                         Spacer(Modifier.height(10.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -570,6 +613,50 @@ fun SettingsScreen(
                         )
                         if (index < selectedProvider.models.lastIndex) {
                             HorizontalDivider(color = BorderHairline, thickness = 1.dp)
+                        }
+                    }
+                    HorizontalDivider(color = BorderHairline, thickness = 1.dp)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 12.dp),
+                    ) {
+                        val isCustomActive = selectedProvider.models.none { it.id == selectedModel } && selectedModel.isNotBlank()
+                        Text(
+                            text = if (isCustomActive) "Custom model active: $selectedModel" else "Or enter a custom model ID",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (isCustomActive) Cyan else TextSecondary,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            OutlinedTextField(
+                                value = customModelDraft,
+                                onValueChange = viewModel::customModelDraftChanged,
+                                placeholder = { Text(selectedProvider.defaultModel.id, color = TextMuted) },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true,
+                                shape = RoundedCornerShape(14.dp),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = Cyan,
+                                    unfocusedBorderColor = Color.White.copy(alpha = 0.10f),
+                                    cursorColor = Cyan,
+                                    focusedContainerColor = SurfaceGlass,
+                                    unfocusedContainerColor = SurfaceGlass,
+                                ),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            TextButton(
+                                onClick = viewModel::applyCustomModel,
+                                enabled = customModelDraft.isNotBlank(),
+                            ) {
+                                Text(
+                                    text = "Use",
+                                    color = if (customModelDraft.isNotBlank()) Cyan else TextMuted,
+                                )
+                            }
                         }
                     }
                 }

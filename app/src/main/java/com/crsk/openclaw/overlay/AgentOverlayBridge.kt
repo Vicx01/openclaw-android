@@ -2,6 +2,7 @@ package com.crsk.openclaw.overlay
 
 import com.crsk.openclaw.data.network.ws.ApprovalKind
 import com.crsk.openclaw.data.network.ws.ApprovalRequest
+import com.crsk.openclaw.data.network.ws.RiskLevel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -26,6 +27,9 @@ class AgentOverlayBridge @Inject constructor() {
     private val _stopRequested = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val stopRequested: SharedFlow<Unit> = _stopRequested.asSharedFlow()
 
+    private val _localApprovalRequests = MutableSharedFlow<ApprovalRequest?>(extraBufferCapacity = 4)
+    val localApprovalRequests: SharedFlow<ApprovalRequest?> = _localApprovalRequests.asSharedFlow()
+
     fun onAgentStarted() {
         _overlayState.update {
             OverlayUiState(visible = true)
@@ -49,14 +53,17 @@ class AgentOverlayBridge @Inject constructor() {
 
     fun onApprovalResolved() {
         _overlayState.update { it.copy(pendingApproval = null) }
+        _localApprovalRequests.tryEmit(null)
     }
 
     fun onAgentDone() {
         _overlayState.value = OverlayUiState(visible = false)
+        _localApprovalRequests.tryEmit(null)
     }
 
     fun onAgentStopped() {
         _overlayState.value = OverlayUiState(visible = false)
+        _localApprovalRequests.tryEmit(null)
     }
 
     fun setExpanded(expanded: Boolean) {
@@ -79,13 +86,8 @@ class AgentOverlayBridge @Inject constructor() {
     }
 
     /**
-     * Surface a "manual control needed" prompt on the overlay bubble and suspend until the
-     * user taps allow/deny (reuses [submitApprovalDecision] → [approvalDecision]). Self-contained:
-     * does NOT touch ApprovalChannel / openclaw resolution. Returns false on timeout so the
-     * agent's take_over never hangs if the bubble overlay is disabled.
-     *
-     * Safe vs the openclaw exec-approval path: ChatViewModel.resolveApproval early-returns when
-     * its own pendingApproval is null (it is, for a take_over), so the shared decision no-ops there.
+     * Surface a "manual control needed" prompt on the overlay bubble (and ChatScreen dialog)
+     * and suspend until the user taps allow/deny.
      */
     suspend fun requestManualHandoff(reason: String, timeoutMs: Long = 120_000L): Boolean {
         val req = ApprovalRequest(
@@ -93,12 +95,46 @@ class AgentOverlayBridge @Inject constructor() {
             kind = ApprovalKind.Exec,
             summary = "Manual control needed",
             detail = reason,
+            riskLevel = RiskLevel.Elevated,
+            riskCategory = "Handoff",
         )
         _overlayState.update { it.copy(visible = true, isExpanded = true, pendingApproval = req) }
+        _localApprovalRequests.tryEmit(req)
         val decision = kotlinx.coroutines.withTimeoutOrNull(timeoutMs) {
             approvalDecision.first()
         }
         _overlayState.update { it.copy(pendingApproval = null) }
+        _localApprovalRequests.tryEmit(null)
+        return decision ?: false
+    }
+
+    /**
+     * Surfaces an element-aware sensitive-action approval prompt (both in ChatScreen's
+     * ApprovalDialog and on the floating / accessibility overlay) and suspends until
+     * the user explicitly approves or denies the action.
+     */
+    suspend fun requestSensitiveActionApproval(
+        summary: String,
+        detail: String,
+        riskLevel: RiskLevel,
+        riskCategory: String?,
+        timeoutMs: Long = 120_000L,
+    ): Boolean {
+        val req = ApprovalRequest(
+            id = "local-${java.util.UUID.randomUUID()}",
+            kind = ApprovalKind.Exec,
+            summary = summary,
+            detail = detail,
+            riskLevel = riskLevel,
+            riskCategory = riskCategory,
+        )
+        _overlayState.update { it.copy(visible = true, isExpanded = true, pendingApproval = req) }
+        _localApprovalRequests.tryEmit(req)
+        val decision = kotlinx.coroutines.withTimeoutOrNull(timeoutMs) {
+            approvalDecision.first()
+        }
+        _overlayState.update { it.copy(pendingApproval = null) }
+        _localApprovalRequests.tryEmit(null)
         return decision ?: false
     }
 

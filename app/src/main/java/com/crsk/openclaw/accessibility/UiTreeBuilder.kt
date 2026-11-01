@@ -86,7 +86,9 @@ object UiTreeBuilder {
             }
         }
 
-        val text = node.text?.toString().orEmpty()
+        val isPwd = try { node.isPassword } catch (_: Exception) { false }
+        val rawText = node.text?.toString().orEmpty()
+        val text = if (isPwd && rawText.isNotEmpty()) "[REDACTED_PASSWORD]" else rawText
         val desc = node.contentDescription?.toString().orEmpty()
         val resId = node.viewIdResourceName?.substringAfterLast(":id/").orEmpty()
         val cls = node.className?.toString().orEmpty()
@@ -111,6 +113,7 @@ object UiTreeBuilder {
                 isChecked = if (node.isCheckable) node.isChecked else null,
                 isCheckable = node.isCheckable,
                 children = children,
+                isPassword = isPwd,
             )
             output.add(element)
         } else {

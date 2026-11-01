@@ -17,6 +17,7 @@ data class ElementNode(
     val isChecked: Boolean?,
     val isCheckable: Boolean,
     val children: List<ElementNode>,
+    val isPassword: Boolean = false,
 ) {
     /** Stable per-snapshot mark id (>=0 for interactables, assigned by MarkAssigner). -1 otherwise. */
     var markId: Int = -1

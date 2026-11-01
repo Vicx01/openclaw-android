@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.crsk.openclaw.bootstrap.GatewayProcess
 import com.crsk.openclaw.bootstrap.GatewayStatus
+import com.crsk.openclaw.data.ChatHistoryStore
 import com.crsk.openclaw.data.model.ChatMessage
 import com.crsk.openclaw.data.model.MessageRole
 import com.crsk.openclaw.data.model.ToolCall
@@ -11,30 +12,27 @@ import com.crsk.openclaw.data.model.ToolCallStatus
 import com.crsk.openclaw.data.network.ChunkEvent
 import com.crsk.openclaw.data.network.GatewayClient
 import com.crsk.openclaw.data.network.ws.ApprovalChannel
-import com.crsk.openclaw.data.network.ws.ApprovalKind
 import com.crsk.openclaw.data.network.ws.ApprovalRequest
 import com.crsk.openclaw.data.network.ws.ChatSession
 import com.crsk.openclaw.data.preferences.AppPreferences
 import com.crsk.openclaw.data.providers.ProviderCatalog
 import com.crsk.openclaw.service.GatewayHealthMonitor
 import com.crsk.openclaw.service.HealthState
-import com.crsk.openclaw.service.ServiceHealth
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.collections.immutable.PersistentList
 import kotlinx.collections.immutable.persistentListOf
 import kotlinx.collections.immutable.toPersistentList
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 
@@ -62,6 +60,7 @@ class ChatViewModel @Inject constructor(
     private val processLifecycle: com.crsk.openclaw.util.AppForegroundState,
     private val overlayBridge: com.crsk.openclaw.overlay.AgentOverlayBridge,
     private val accessibilityHolder: com.crsk.openclaw.accessibility.AccessibilityServiceHolder,
+    private val chatHistoryStore: ChatHistoryStore,
     @dagger.hilt.android.qualifiers.ApplicationContext private val applicationContext: android.content.Context,
 ) : ViewModel() {
 
@@ -71,6 +70,23 @@ class ChatViewModel @Inject constructor(
 
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
+
+    private val _accessibilityConnected = MutableStateFlow(accessibilityHolder.isConnected())
+    val accessibilityConnected: StateFlow<Boolean> = _accessibilityConnected.asStateFlow()
+
+    val activeModelLabel: StateFlow<String> = combine(
+        preferences.apiProvider,
+        preferences.selectedModel,
+    ) { providerId, modelId ->
+        val (resolvedProvider, resolvedModel) = selectProvider(providerId, modelId)
+        val p = ProviderCatalog.byId(resolvedProvider)
+        val m = p?.models?.firstOrNull { it.id == resolvedModel }
+        m?.displayName ?: resolvedModel.substringAfterLast('/')
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), "")
+
+    fun refreshReadiness() {
+        _accessibilityConnected.value = accessibilityHolder.isConnected()
+    }
 
     /** Cumulative tokens since install (or last reset in Settings). Drives the chat header chip. */
     val lifetimeInputTokens: StateFlow<Long> = preferences.lifetimeInputTokens
@@ -83,9 +99,23 @@ class ChatViewModel @Inject constructor(
 
     init {
         viewModelScope.launch {
+            val saved = chatHistoryStore.load()
+            if (saved.isNotEmpty() && _state.value.messages.isEmpty()) {
+                _state.value = _state.value.copy(messages = saved.toPersistentList())
+            }
+        }
+    }
+
+    init {
+        viewModelScope.launch {
             approvalChannel.pending.collect {
                 _pendingApproval.value = it
                 overlayBridge.onApprovalRequired(it)
+            }
+        }
+        viewModelScope.launch {
+            overlayBridge.localApprovalRequests.collect { req ->
+                _pendingApproval.value = req
             }
         }
     }
@@ -109,7 +139,10 @@ class ChatViewModel @Inject constructor(
     init {
         viewModelScope.launch {
             overlayBridge.approvalDecision.collect { allow ->
-                resolveApproval(allow)
+                val req = _pendingApproval.value ?: return@collect
+                if (!req.id.startsWith("local-") && !req.id.startsWith("takeover-")) {
+                    resolveApproval(allow)
+                }
             }
         }
     }
@@ -117,6 +150,11 @@ class ChatViewModel @Inject constructor(
     fun resolveApproval(allow: Boolean) {
         val req = _pendingApproval.value ?: return
         _pendingApproval.value = null
+        if (req.id.startsWith("local-") || req.id.startsWith("takeover-")) {
+            overlayBridge.submitApprovalDecision(allow)
+            overlayBridge.onApprovalResolved()
+            return
+        }
         overlayBridge.onApprovalResolved()
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { approvalChannel.resolve(req.id, req.kind, allow) }
@@ -133,19 +171,23 @@ class ChatViewModel @Inject constructor(
 
     fun sendMessage(content: String) {
         if (content.isBlank() || _state.value.isGenerating) return
+        refreshReadiness()
 
         if (!gatewayProcess.isRunning()) {
             _state.value = _state.value.copy(error = "Gateway not running. Start it from Settings.")
             return
         }
 
+        val providerIdPref = preferences.apiProvider.value
+        val provider = ProviderCatalog.byId(providerIdPref) ?: ProviderCatalog.default
+        if (preferences.getApiKey(provider.id).isBlank()) {
+            _state.value = _state.value.copy(
+                error = "No API key configured for ${provider.displayName}. Open Settings to enter and test your API key.",
+            )
+            return
+        }
+
         val userMessage = ChatMessage(role = MessageRole.USER, content = content.trim())
-        // Soft cap on visible history. The model itself only sees the last few
-        // turns (memoryTurns=6 in ChatSession), so trimming older UI bubbles
-        // doesn't change semantics — it just keeps LazyColumn slot tables
-        // small and `messages.add(...)` PersistentList operations fast on
-        // marathon sessions. When we cross the cap we trim back to the keep
-        // target so we're not trimming on every single send.
         val prior = _state.value.messages.let { all ->
             if (all.size > MAX_VISIBLE_MESSAGES) {
                 val drop = all.size - KEEP_VISIBLE_MESSAGES
@@ -159,7 +201,6 @@ class ChatViewModel @Inject constructor(
             messages = baseMessages.add(pendingAssistant),
             isGenerating = true,
             error = null,
-            // Reset per-turn token counters; they accumulate as Usage events arrive.
             turnInputTokens = 0,
             turnOutputTokens = 0,
         )
@@ -167,19 +208,11 @@ class ChatViewModel @Inject constructor(
 
         streamJob = viewModelScope.launch {
             val accumulated = StringBuilder()
-            // Insertion-ordered map keyed by callId so chips render in the order the agent invoked them.
             val toolCallsByCallId = LinkedHashMap<String, ToolCall>()
-            // Coalesce streaming text: emitting chat state on every TextDelta forces a
-            // full LazyColumn recompose per character. Throttle text to ~16 fps; emit
-            // structural events (tool start/result, errors, done) immediately.
             var lastEmitMs = 0L
-            // Cache the immutable snapshot so unchanged tool-call lists keep the same
-            // reference across emissions — MessageBubble stays skippable.
             var cachedToolCalls: PersistentList<ToolCall> = persistentListOf()
             var toolCallsDirty = false
 
-            // Extracted so both the primary path and the 429-fallback path share
-            // identical chunk handling without copy-paste drift.
             suspend fun handleChunk(event: ChunkEvent) {
                 when (event) {
                     is ChunkEvent.TextDelta -> accumulated.append(event.text)
@@ -192,9 +225,8 @@ class ChatViewModel @Inject constructor(
                         )
                         toolCallsDirty = true
                         overlayBridge.onToolStarted(
-                            ToolDetailFormatter.overlayLabel(event.name, event.argsJson)
+                            ToolDetailFormatter.overlayLabel(event.name, event.argsJson),
                         )
-                        // Refresh the currentPackage badge based on whichever app is now in focus.
                         val pkg = runCatching {
                             accessibilityHolder.getServiceOrNull()?.getCurrentPackage()
                         }.getOrNull()
@@ -210,9 +242,8 @@ class ChatViewModel @Inject constructor(
                         toolCallsDirty = true
                         overlayBridge.onToolFinished()
                     }
-                    is ChunkEvent.Lifecycle -> { /* could surface a "thinking…" indicator */ }
+                    is ChunkEvent.Lifecycle -> { /* lifecycle indicator */ }
                     is ChunkEvent.Usage -> {
-                        // Accumulate per-turn + lifetime token counts.
                         val cur = _state.value
                         val newTurnIn = cur.turnInputTokens + event.inputTokens
                         val newTurnOut = cur.turnOutputTokens + event.outputTokens
@@ -223,22 +254,19 @@ class ChatViewModel @Inject constructor(
                         viewModelScope.launch {
                             preferences.addTokenUsage(event.inputTokens.toLong(), event.outputTokens.toLong())
                         }
-                        // Runaway guard: a single user turn going past 250k input tokens is almost
-                        // certainly a tool-loop blowup. Kill the stream and tell the user so they
-                        // don't accidentally spend ₹100s on one stuck conversation.
                         if (newTurnIn > RUNAWAY_TURN_INPUT_TOKENS) {
-                            android.util.Log.w("ChatViewModel",
-                                "Runaway turn: $newTurnIn input tokens, cancelling stream")
+                            android.util.Log.w(
+                                "ChatViewModel",
+                                "Runaway turn: $newTurnIn input tokens, cancelling stream",
+                            )
                             _state.value = _state.value.copy(
                                 error = "Stopped — this turn used over ${formatK(newTurnIn)} input tokens. " +
                                     "Try Clear to reset and rephrase.",
                             )
-                            streamJob?.cancel()
                             stopGenerating()
                         }
                     }
                     is ChunkEvent.AgentError -> {
-                        // Non-fatal — surface to the user but keep streaming.
                         _state.value = _state.value.copy(error = event.text)
                     }
                     is ChunkEvent.Done -> {
@@ -260,11 +288,13 @@ class ChatViewModel @Inject constructor(
                         toolCallsDirty = false
                     }
                     _state.value = _state.value.copy(
-                        messages = baseMessages.add(pendingAssistant.copy(
-                            content = accumulated.toString(),
-                            isStreaming = true,
-                            toolCalls = cachedToolCalls,
-                        )),
+                        messages = baseMessages.add(
+                            pendingAssistant.copy(
+                                content = accumulated.toString(),
+                                isStreaming = true,
+                                toolCalls = cachedToolCalls,
+                            ),
+                        ),
                     )
                 }
             }
@@ -276,10 +306,6 @@ class ChatViewModel @Inject constructor(
             )
 
             try {
-                // Safety timeout: if the entire stream takes longer than 35 minutes
-                // (slightly above openclaw's 30-min agent timeout), force-close.
-                // This prevents the UI from hanging forever if the server drops
-                // the connection without sending lifecycle:end.
                 val completed = withTimeoutOrNull(35 * 60_000L) {
                     chatSession.streamChat(baseMessages, providerId, modelId, emptyMap(), reflection)
                         .collect { event -> handleChunk(event) }
@@ -287,6 +313,8 @@ class ChatViewModel @Inject constructor(
                 if (completed == null) {
                     android.util.Log.w("ChatViewModel", "stream timed out after 35 min")
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 finishWithError(baseMessages, e.message ?: "Failed to get response", accumulated.toString())
             }
@@ -295,37 +323,57 @@ class ChatViewModel @Inject constructor(
                 val sealedToolCalls = toolCallsByCallId.values
                     .map { if (it.status == ToolCallStatus.Running) it.copy(status = ToolCallStatus.Done) else it }
                     .toPersistentList()
-                _state.value = _state.value.copy(
-                    messages = baseMessages.add(pendingAssistant.copy(
+                val finalMessages = baseMessages.add(
+                    pendingAssistant.copy(
                         content = accumulated.toString(),
                         isStreaming = false,
                         toolCalls = sealedToolCalls,
-                    )),
+                    ),
+                )
+                _state.value = _state.value.copy(
+                    messages = finalMessages,
                     isGenerating = false,
                 )
+                chatHistoryStore.save(finalMessages)
             }
-
         }
     }
 
     fun stopGenerating() {
+        // 1. Synchronously block `:3001` bridge actions and send abort RPC to `:3000`
+        chatSession.abortCurrentRun("Stopped by user")
+        // 2. Deny any pending approval so suspended actions unblock as denied
+        if (_pendingApproval.value != null) {
+            resolveApproval(false)
+        }
+        // 3. Cancel active stream flow
         streamJob?.cancel()
         streamJob = null
         val current = _state.value.messages
         val updated = if (current.isNotEmpty() && current.last().isStreaming) {
-            current.set(current.lastIndex, current.last().copy(isStreaming = false))
+            val last = current.last()
+            val stoppedContent = if (last.content.isBlank()) {
+                "⏹ Stopped by user."
+            } else {
+                last.content + "\n\n⏹ Stopped by user."
+            }
+            val stoppedTools = last.toolCalls.map { tc ->
+                if (tc.status == ToolCallStatus.Running || tc.status == ToolCallStatus.Pending) {
+                    tc.copy(status = ToolCallStatus.Failed, resultPreview = "Stopped by user")
+                } else tc
+            }.toPersistentList()
+            current.set(current.lastIndex, last.copy(content = stoppedContent, isStreaming = false, toolCalls = stoppedTools))
         } else current
         _state.value = _state.value.copy(messages = updated, isGenerating = false)
         overlayBridge.onAgentStopped()
+        viewModelScope.launch { chatHistoryStore.save(updated) }
     }
 
     fun clearChat() {
         stopGenerating()
         chatSession.resetSession()
-        // ChatUiState() defaults messages to empty + per-turn counters to 0. Server-side
-        // openclaw context for every sessionKey used since the last Clear is fired off
-        // asynchronously inside resetSession() (best-effort).
         _state.value = ChatUiState()
+        viewModelScope.launch { chatHistoryStore.clear() }
     }
 
     /** Wipe the persistent lifetime token total (Settings → Reset usage). */
@@ -334,33 +382,37 @@ class ChatViewModel @Inject constructor(
     }
 
     private fun finishWithError(baseMessages: PersistentList<ChatMessage>, errorText: String, partial: String = "") {
-        _state.value = ChatUiState(
-            messages = baseMessages.add(ChatMessage(
+        val updatedMessages = baseMessages.add(
+            ChatMessage(
                 role = MessageRole.ASSISTANT,
                 content = partial.ifEmpty { errorText },
                 isStreaming = false,
-            )),
+            ),
+        )
+        _state.value = ChatUiState(
+            messages = updatedMessages,
             isGenerating = false,
             error = errorText,
         )
+        viewModelScope.launch { chatHistoryStore.save(updatedMessages) }
     }
 
     private fun applyHeartbeatChunk(chunk: com.crsk.openclaw.data.network.ws.HeartbeatChunk) {
-        // Single targeted update on a PersistentList — O(log n) structural-shared tail
-        // edit instead of an O(n) toMutableList() + full re-copy per chunk.
         val messages = _state.value.messages
         val idx = messages.indexOfFirst { it.id == chunk.messageId }
         val updated: PersistentList<ChatMessage> = when (chunk) {
             is com.crsk.openclaw.data.network.ws.HeartbeatChunk.NewMessage -> {
                 if (idx == -1) {
-                    messages.add(com.crsk.openclaw.data.model.ChatMessage(
-                        id = chunk.messageId,
-                        role = com.crsk.openclaw.data.model.MessageRole.ASSISTANT,
-                        content = "",
-                        timestamp = chunk.timestampMs,
-                        isStreaming = true,
-                        isHeartbeat = true,
-                    ))
+                    messages.add(
+                        ChatMessage(
+                            id = chunk.messageId,
+                            role = MessageRole.ASSISTANT,
+                            content = "",
+                            timestamp = chunk.timestampMs,
+                            isStreaming = true,
+                            isHeartbeat = true,
+                        ),
+                    )
                 } else messages
             }
             is com.crsk.openclaw.data.network.ws.HeartbeatChunk.TextDelta -> {
@@ -369,9 +421,10 @@ class ChatViewModel @Inject constructor(
             }
             is com.crsk.openclaw.data.network.ws.HeartbeatChunk.ToolStart -> {
                 if (idx >= 0) {
-                    val tc = com.crsk.openclaw.data.model.ToolCall(
-                        name = chunk.name, argumentsJson = chunk.argsJson,
-                        status = com.crsk.openclaw.data.model.ToolCallStatus.Running,
+                    val tc = ToolCall(
+                        name = chunk.name,
+                        argumentsJson = chunk.argsJson,
+                        status = ToolCallStatus.Running,
                         callId = chunk.callId,
                     )
                     messages.set(idx, messages[idx].copy(toolCalls = messages[idx].toolCalls.add(tc)))
@@ -382,8 +435,7 @@ class ChatViewModel @Inject constructor(
                     val newToolCalls = messages[idx].toolCalls.map {
                         if (it.callId == chunk.callId) it.copy(
                             resultPreview = chunk.text.take(500),
-                            status = if (chunk.ok) com.crsk.openclaw.data.model.ToolCallStatus.Done
-                            else com.crsk.openclaw.data.model.ToolCallStatus.Failed,
+                            status = if (chunk.ok) ToolCallStatus.Done else ToolCallStatus.Failed,
                         ) else it
                     }.toPersistentList()
                     messages.set(idx, messages[idx].copy(toolCalls = newToolCalls))
@@ -407,17 +459,22 @@ class ChatViewModel @Inject constructor(
             is com.crsk.openclaw.data.network.ws.HeartbeatChunk.Error -> {
                 if (idx >= 0) {
                     val curMsg = messages[idx]
-                    messages.set(idx, curMsg.copy(
-                        content = (if (curMsg.content.isBlank()) "" else curMsg.content + "\n\n") +
-                            "[heartbeat error] " + chunk.text,
-                        isStreaming = false,
-                    ))
-                } else messages.add(com.crsk.openclaw.data.model.ChatMessage(
-                    id = chunk.messageId,
-                    role = com.crsk.openclaw.data.model.MessageRole.ASSISTANT,
-                    content = "[heartbeat error] " + chunk.text,
-                    isHeartbeat = true,
-                ))
+                    messages.set(
+                        idx,
+                        curMsg.copy(
+                            content = (if (curMsg.content.isBlank()) "" else curMsg.content + "\n\n") +
+                                "[heartbeat error] " + chunk.text,
+                            isStreaming = false,
+                        ),
+                    )
+                } else messages.add(
+                    ChatMessage(
+                        id = chunk.messageId,
+                        role = MessageRole.ASSISTANT,
+                        content = "[heartbeat error] " + chunk.text,
+                        isHeartbeat = true,
+                    ),
+                )
             }
         }
         if (updated !== messages) {
@@ -426,32 +483,31 @@ class ChatViewModel @Inject constructor(
     }
 }
 
-/** Per-user-turn input-token ceiling. Above this we kill the stream — a single message
- *  shouldn't cost more than this. At ~$0.30/M (Gemini Flash) that's $0.08 worst case. */
 private const val RUNAWAY_TURN_INPUT_TOKENS: Long = 250_000
-
-/** Soft cap on the visible chat history. When `messages.size` exceeds this we
- *  trim back to KEEP_VISIBLE_MESSAGES so the LazyColumn doesn't accumulate a
- *  giant slot table over multi-day sessions. The model only sees the last few
- *  turns anyway (memoryTurns=6 in ChatSession). */
 private const val MAX_VISIBLE_MESSAGES = 500
 private const val KEEP_VISIBLE_MESSAGES = 400
 
 private fun formatK(n: Long): String = if (n >= 1000) "${n / 1000}k" else n.toString()
 
-/** Pure routing decision — tested without constructing ChatViewModel.
- *
- *  Resolves the user's Settings selection against the provider catalog:
- *  an unknown provider id falls back to the catalog default provider, and a
- *  model that doesn't belong to the resolved provider falls back to that
- *  provider's default model. Guarantees the returned pair always names a
- *  provider/model combination that refreshMcpConfig will have written into
- *  openclaw's config. */
 fun selectProvider(
     providerId: String,
     modelId: String,
 ): Pair<String, String> {
-    val provider = ProviderCatalog.byId(providerId) ?: ProviderCatalog.default
-    val model = provider.models.firstOrNull { it.id == modelId } ?: provider.defaultModel
-    return provider.id to model.id
+    val provider = ProviderCatalog.byId(providerId)
+        ?: return ProviderCatalog.default.id to ProviderCatalog.default.defaultModel.id
+    val trimmedModel = modelId.trim()
+    if (trimmedModel.isBlank()) {
+        return provider.id to provider.defaultModel.id
+    }
+    val catalogMatch = provider.models.firstOrNull { it.id == trimmedModel }
+    if (catalogMatch != null) {
+        return provider.id to catalogMatch.id
+    }
+    val belongsToOtherProvider = ProviderCatalog.all.any { other ->
+        other.id != provider.id && other.models.any { it.id == trimmedModel }
+    }
+    if (belongsToOtherProvider) {
+        return provider.id to provider.defaultModel.id
+    }
+    return provider.id to trimmedModel
 }

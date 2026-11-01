@@ -48,4 +48,10 @@ class ChatViewModelRoutingTest {
         assertEquals("nim", provider)
         assertEquals("nvidia/nemotron-3-super-120b-a12b", model)
     }
+
+    @Test fun `custom model ID for a valid provider is preserved`() {
+        val (provider, model) = selectProvider("nim", "deepseek-ai/deepseek-v3.1")
+        assertEquals("nim", provider)
+        assertEquals("deepseek-ai/deepseek-v3.1", model)
+    }
 }

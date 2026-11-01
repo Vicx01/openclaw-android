@@ -10,23 +10,29 @@ class GestureController(
 
     suspend fun tap(x: Int, y: Int): Boolean = service().dispatchTap(x, y)
 
+    suspend fun tapNode(target: ElementNode): TapResult {
+        if (target.isClickable && service().performSemanticClick(target.bounds)) {
+            return TapResult(true, "clicked \"${target.displayText}\" (semantic)")
+        }
+        val ok = service().dispatchTap(target.centerX, target.centerY)
+        return TapResult(ok, if (ok) "tapped \"${target.displayText}\" (${target.centerX}, ${target.centerY})" else "gesture cancelled")
+    }
+
     suspend fun longTap(x: Int, y: Int): Boolean = service().dispatchLongTap(x, y)
 
     suspend fun tapByText(text: String): TapResult {
         val snap = service().getSnapshot() ?: return TapResult(false, "no UI snapshot available")
         val matches = findAllByText(snap.nodes, text)
         if (matches.isEmpty()) return TapResult(false, "no element matching \"$text\"")
-        val target = matches.first()
-        val ok = service().dispatchTap(target.centerX, target.centerY)
-        return TapResult(ok, if (ok) "tapped \"${target.displayText}\"" else "gesture cancelled")
+        val target = matches.firstOrNull { it.isClickable } ?: matches.first()
+        return tapNode(target)
     }
 
     suspend fun tapByMark(markId: Int): TapResult {
         val snap = service().getSnapshot() ?: return TapResult(false, "no UI snapshot available")
         val target = snap.marks.getOrNull(markId)
             ?: return TapResult(false, "stale mark id $markId — re-observe")
-        val ok = service().dispatchTap(target.centerX, target.centerY)
-        return TapResult(ok, if (ok) "tapped mark $markId (${target.displayText})" else "gesture cancelled")
+        return tapNode(target)
     }
 
     suspend fun doubleTapByMark(markId: Int): TapResult {
@@ -53,6 +59,21 @@ class GestureController(
         }
     }
 
+    /**
+     * Scrolls the viewport in [direction] ("down" reveals content further down the page by
+     * swiping the finger upward; "up" reveals content higher on the page).
+     */
+    suspend fun scrollViewport(direction: String, screenWidth: Int, screenHeight: Int): Boolean {
+        val swipeDir = when (direction.lowercase()) {
+            "down" -> "up"
+            "up" -> "down"
+            "right" -> "left"
+            "left" -> "right"
+            else -> "up"
+        }
+        return swipeDirection(swipeDir, screenWidth, screenHeight)
+    }
+
     suspend fun scrollToFind(
         direction: String,
         text: String,
@@ -68,8 +89,15 @@ class GestureController(
                     return ScrollResult(found = true, scrolls = attempt, element = matches.first())
                 }
             }
-            swipeDirection(direction, screenWidth, screenHeight)
+            scrollViewport(direction, screenWidth, screenHeight)
             delay(SCROLL_SETTLE_MS)
+        }
+        val finalSnap = service().getSnapshot()
+        if (finalSnap != null) {
+            val matches = findAllByText(finalSnap.nodes, text)
+            if (matches.isNotEmpty()) {
+                return ScrollResult(found = true, scrolls = maxScrolls, element = matches.first())
+            }
         }
         return ScrollResult(found = false, scrolls = maxScrolls, element = null)
     }
@@ -94,7 +122,7 @@ class GestureController(
         val results = mutableListOf<ElementNode>()
         fun recurse(list: List<ElementNode>) {
             for (node in list) {
-                if (node.matchesText(text)) results.add(node)
+                if (!node.occluded && node.matchesText(text)) results.add(node)
                 recurse(node.children)
             }
         }

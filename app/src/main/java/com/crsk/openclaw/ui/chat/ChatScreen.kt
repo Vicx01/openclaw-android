@@ -193,11 +193,20 @@ fun ChatScreen(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val gatewayRunning by viewModel.gatewayRunning.collectAsStateWithLifecycle()
+    val accessibilityConnected by viewModel.accessibilityConnected.collectAsStateWithLifecycle()
+    val activeModelLabel by viewModel.activeModelLabel.collectAsStateWithLifecycle()
     val pendingApproval by viewModel.pendingApproval.collectAsStateWithLifecycle()
     val lifetimeIn by viewModel.lifetimeInputTokens.collectAsStateWithLifecycle()
     val lifetimeOut by viewModel.lifetimeOutputTokens.collectAsStateWithLifecycle()
 
     val view = LocalView.current
+    val context = androidx.compose.ui.platform.LocalContext.current
+    LaunchedEffect(Unit) {
+        while (true) {
+            viewModel.refreshReadiness()
+            kotlinx.coroutines.delay(2500L)
+        }
+    }
     var showClearConfirm by rememberSaveable { mutableStateOf(false) }
 
     // Receive haptic: a gentle tap when the agent's reply finishes streaming.
@@ -235,6 +244,8 @@ fun ChatScreen(
         ) {
             ChatTopBar(
                 gatewayRunning = gatewayRunning,
+                accessibilityConnected = accessibilityConnected,
+                activeModelLabel = activeModelLabel,
                 onNewChat = { if (state.messages.isNotEmpty()) showClearConfirm = true },
             )
 
@@ -250,6 +261,18 @@ fun ChatScreen(
             }
 
             if (!gatewayRunning) GatewayStoppedBanner()
+            if (!accessibilityConnected) {
+                AccessibilityDisabledBanner(
+                    onEnable = {
+                        runCatching {
+                            context.startActivity(
+                                android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                            )
+                        }
+                    },
+                )
+            }
             state.error?.let { ErrorBanner(it) }
 
             val listState = rememberLazyListState()
@@ -392,7 +415,12 @@ fun ChatScreen(
 }
 
 @Composable
-private fun ChatTopBar(gatewayRunning: Boolean, onNewChat: () -> Unit) {
+private fun ChatTopBar(
+    gatewayRunning: Boolean,
+    accessibilityConnected: Boolean,
+    activeModelLabel: String,
+    onNewChat: () -> Unit,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -420,11 +448,22 @@ private fun ChatTopBar(gatewayRunning: Boolean, onNewChat: () -> Unit) {
                 modifier = Modifier
                     .size(6.dp)
                     .clip(CircleShape)
-                    .background(if (gatewayRunning) Success else Warning),
+                    .background(
+                        when {
+                            gatewayRunning && accessibilityConnected -> Success
+                            gatewayRunning -> Warning
+                            else -> Danger
+                        },
+                    ),
             )
             Spacer(Modifier.width(6.dp))
+            val statusLabel = buildString {
+                append(if (gatewayRunning) "Online" else "Offline")
+                if (accessibilityConnected) append(" · Screen Ready")
+                if (activeModelLabel.isNotBlank()) append(" · ${activeModelLabel.take(18)}")
+            }
             Text(
-                text = if (gatewayRunning) "Online" else "Gateway offline",
+                text = statusLabel,
                 style = MaterialTheme.typography.labelSmall,
                 color = TextSecondary,
             )
@@ -609,6 +648,33 @@ private fun GatewayStoppedBanner() {
             style = MaterialTheme.typography.bodySmall,
             color = Danger,
         )
+    }
+}
+
+@Composable
+private fun AccessibilityDisabledBanner(onEnable: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Warning.copy(alpha = 0.12f))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "Accessibility Service is off — enable it for screen control.",
+            style = MaterialTheme.typography.bodySmall,
+            color = Warning,
+            modifier = Modifier.weight(1f),
+        )
+        TextButton(onClick = onEnable) {
+            Text(
+                text = "Enable",
+                style = MaterialTheme.typography.labelMedium,
+                color = AccentBlue,
+            )
+        }
     }
 }
 

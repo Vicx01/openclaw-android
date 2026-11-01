@@ -1,7 +1,9 @@
 package com.crsk.openclaw.data.network.ws
 
 import android.util.Log
+import com.crsk.openclaw.accessibility.TaskExecutionGate
 import com.crsk.openclaw.data.preferences.AppPreferences
+import com.crsk.openclaw.util.CredentialRedactor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -30,6 +32,7 @@ enum class ApprovalKind { Exec, Plugin }
 class ApprovalChannel @Inject constructor(
     private val ws: WsRpcClient,
     private val preferences: AppPreferences,
+    private val taskGate: TaskExecutionGate,
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val _pending = MutableSharedFlow<ApprovalRequest>(replay = 0, extraBufferCapacity = 8)
@@ -44,7 +47,7 @@ class ApprovalChannel @Inject constructor(
             ws.events
                 .filter {
                     it.event == "exec.approval.requested" ||
-                    it.event == "plugin.approval.requested"
+                        it.event == "plugin.approval.requested"
                 }
                 .collect { handle(it.event, it.payload) }
         }
@@ -61,11 +64,24 @@ class ApprovalChannel @Inject constructor(
 
         val kind = if (eventName.startsWith("plugin.")) ApprovalKind.Plugin else ApprovalKind.Exec
 
+        // Hard cancellation guard: never auto-approve after user pressed Stop.
+        if (taskGate.isCancelled()) {
+            Log.i(TAG, "Auto-denying $kind id=$id because task is cancelled")
+            resolve(id, kind, allow = false)
+            return
+        }
+
+        // Credential exfiltration guard: block shell commands touching key/token files.
+        if (CredentialRedactor.referencesProtectedCredentialFile(payload.toString())) {
+            Log.w(TAG, "Auto-denying $kind id=$id targeting protected credential file")
+            resolve(id, kind, allow = false)
+            return
+        }
+
         // Auto-approve path: skip the UI, resolve immediately — UNLESS the action
         // is classified as sensitive (money, messaging, install, account delete).
         // For sensitive actions we ALWAYS surface the dialog so there is an
-        // explicit, per-action consent record. This is non-negotiable for the
-        // DPDP §6 / GDPR Art. 7 informed-consent posture.
+        // explicit, per-action consent record.
         val autoApprove = preferences.autoApproveAgentActions.first()
         val risk = SensitiveIntentClassifier.classify(payload)
         val sensitive = risk.level != RiskLevel.Low
@@ -87,8 +103,8 @@ class ApprovalChannel @Inject constructor(
             ApprovalRequest(
                 id = id,
                 kind = kind,
-                summary = summary,
-                detail = payload.toString(2).take(2000),
+                summary = CredentialRedactor.redact(summary),
+                detail = CredentialRedactor.redact(payload.toString(2).take(2000)),
                 riskLevel = risk.level,
                 riskCategory = risk.category,
             ),
@@ -100,11 +116,12 @@ class ApprovalChannel @Inject constructor(
             ApprovalKind.Exec -> "exec.approval.resolve"
             ApprovalKind.Plugin -> "plugin.approval.resolve"
         }
+        val decision = if (allow && !taskGate.isCancelled()) "allow" else "deny"
         ws.call(
             method = method,
             params = JSONObject().apply {
                 put("id", id)
-                put("decision", if (allow) "allow" else "deny")
+                put("decision", decision)
             },
         )
     }

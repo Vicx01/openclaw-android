@@ -2,6 +2,8 @@ package com.crsk.openclaw.accessibility
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
 
 class ActionDispatcher(
     private val holder: AccessibilityServiceHolder,
@@ -19,6 +21,8 @@ class ActionDispatcher(
         val metrics = appContext.resources.displayMetrics
         return metrics.widthPixels to metrics.heightPixels
     }
+
+    suspend fun tapNode(target: ElementNode): TapResult = gestureController.tapNode(target)
 
     suspend fun tap(text: String? = null, x: Int? = null, y: Int? = null, index: Int? = null): TapResult {
         return when {
@@ -65,7 +69,7 @@ class ActionDispatcher(
         if (text != null) {
             return gestureController.scrollToFind(direction, text, clampedMax, w, h)
         }
-        gestureController.swipeDirection(direction, w, h)
+        gestureController.scrollViewport(direction, w, h)
         return ScrollResult(found = false, scrolls = 1, element = null)
     }
 
@@ -77,14 +81,17 @@ class ActionDispatcher(
      *  whether to retry after tapping a field. */
     data class TypeResult(val ok: Boolean, val reason: String)
 
-    fun typeText(text: String): TypeResult {
-        // Path 1 — preferred: a focused EditText accepts ACTION_SET_TEXT directly.
-        // Works in 95 %+ of cases when the agent has just tapped an input field.
-        if (service().setTextOnFocused(text)) return TypeResult(true, "set via accessibility on focused field")
+    fun typeText(text: String, targetBounds: IntBox? = null, submit: Boolean = false): TypeResult {
+        // Path 1 — preferred: focused (or target-bounds) EditText accepts ACTION_SET_TEXT
+        // or clipboard ACTION_PASTE directly via AccessibilityService.
+        if (service().setTextOnFocused(text, targetBounds)) {
+            if (submit) {
+                runCatching { service().performImeEnter() }
+            }
+            return TypeResult(true, "set via accessibility on editable field")
+        }
 
-        // Path 2 — shell fallback via Shizuku (optional). Useful when the focused
-        // view doesn't accept ACTION_SET_TEXT (some legacy WebViews / Compose
-        // BasicTextField timing edge cases). Skipped silently if shell isn't wired.
+        // Path 2 — shell fallback via Shizuku (optional).
         val escaped = text
             .replace("\\", "\\\\")
             .replace("\"", "\\\"")
@@ -98,17 +105,37 @@ class ActionDispatcher(
             .replace("<", "\\<")
             .replace(">", "\\>")
         val (exit, _, err) = shellExec(listOf("input", "text", escaped))
-        if (exit == 0) return TypeResult(true, "set via shell input")
+        if (exit == 0) {
+            if (submit) {
+                runCatching { shellExec(listOf("input", "keyevent", "66")) }
+            }
+            return TypeResult(true, "set via shell input")
+        }
 
         // Path 3 — neither worked. Return the actual reason so the agent can react.
-        // The most common cause is "no editable view is focused" — the model should
-        // tap an EditText from the legend, then retry.
         val reason = when {
             err.contains("shell not wired", ignoreCase = true) ||
                 err.isBlank() -> "no focused editable field — tap an input from the legend first, then retry type"
             else -> "type failed: $err"
         }
         return TypeResult(false, reason)
+    }
+
+    suspend fun pressEnter(): Boolean {
+        if (service().performImeEnter()) return true
+        // Try tapping common IME action labels if visible on screen
+        val snap = runCatching { getSnapshot() }.getOrNull()
+        if (snap != null && snap.keyboardVisible) {
+            val imeActionLabels = listOf("Search", "Go", "Done", "Enter", "Next")
+            val match = snap.marks.firstOrNull { m ->
+                imeActionLabels.any { label -> m.displayText.equals(label, ignoreCase = true) }
+            }
+            if (match != null && gestureController.tapNode(match).ok) {
+                return true
+            }
+        }
+        val (exit, _, _) = shellExec(listOf("input", "keyevent", "66"))
+        return exit == 0
     }
 
     fun globalAction(action: String): Boolean = when (action.lowercase()) {
@@ -122,16 +149,72 @@ class ActionDispatcher(
         else -> false
     }
 
-    fun launchApp(packageName: String): Boolean {
-        val intent = appContext.packageManager.getLaunchIntentForPackage(packageName)
-            ?: return false
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        return try {
-            appContext.startActivity(intent)
-            true
-        } catch (_: Exception) {
-            false
+    fun launchApp(packageOrName: String): Boolean {
+        val raw = packageOrName.trim()
+        if (raw.isEmpty()) return false
+        val pm = appContext.packageManager
+
+        // 1. Direct package launch intent
+        pm.getLaunchIntentForPackage(raw)?.let { intent ->
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (runCatching { appContext.startActivity(intent) }.isSuccess) return true
         }
+
+        // 2. Built-in system intents & common aliases (Settings, Chrome/Browser, etc.)
+        val lower = raw.lowercase()
+        if (lower == "settings" || lower == "com.android.settings" || lower == "system settings") {
+            val settingsIntent = Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (runCatching { appContext.startActivity(settingsIntent) }.isSuccess) return true
+        }
+        val aliasCandidates = when (lower) {
+            "chrome", "google chrome", "browser", "com.android.chrome" -> listOf(
+                "com.android.chrome",
+                "com.chrome.beta",
+                "com.chrome.dev",
+                "org.mozilla.firefox",
+                "com.brave.browser",
+                "com.sec.android.app.sbrowser",
+            )
+            "youtube", "yt" -> listOf("com.google.android.youtube")
+            "gmail", "email", "mail" -> listOf("com.google.android.gm")
+            "whatsapp" -> listOf("com.whatsapp", "com.whatsapp.w4b")
+            "messages", "sms" -> listOf("com.google.android.apps.messaging", "com.samsung.android.messaging")
+            "play store", "playstore", "google play" -> listOf("com.android.vending")
+            "maps", "google maps" -> listOf("com.google.android.apps.maps")
+            else -> emptyList()
+        }
+        for (pkg in aliasCandidates) {
+            pm.getLaunchIntentForPackage(pkg)?.let { intent ->
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (runCatching { appContext.startActivity(intent) }.isSuccess) return true
+            }
+        }
+        if (lower == "chrome" || lower == "browser" || lower == "com.android.chrome") {
+            val webIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (runCatching { appContext.startActivity(webIntent) }.isSuccess) return true
+        }
+
+        // 3. Search installed launchable activities by app label or partial package name
+        val mainIntent = Intent(Intent.ACTION_MAIN, null).addCategory(Intent.CATEGORY_LAUNCHER)
+        val resolveInfos = runCatching { pm.queryIntentActivities(mainIntent, 0) }.getOrDefault(emptyList())
+        val matchedPkg = resolveInfos.firstOrNull { info ->
+            val label = runCatching { info.loadLabel(pm).toString() }.getOrDefault("")
+            val pkg = info.activityInfo?.packageName.orEmpty()
+            label.equals(raw, ignoreCase = true) ||
+                label.contains(raw, ignoreCase = true) ||
+                pkg.equals(raw, ignoreCase = true) ||
+                pkg.substringAfterLast('.').equals(raw, ignoreCase = true)
+        }?.activityInfo?.packageName
+
+        if (!matchedPkg.isNullOrBlank()) {
+            pm.getLaunchIntentForPackage(matchedPkg)?.let { intent ->
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (runCatching { appContext.startActivity(intent) }.isSuccess) return true
+            }
+        }
+
+        return false
     }
 
     fun stopApp(packageName: String): Boolean {
