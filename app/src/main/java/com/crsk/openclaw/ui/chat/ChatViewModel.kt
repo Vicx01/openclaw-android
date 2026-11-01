@@ -451,7 +451,24 @@ fun selectProvider(
     providerId: String,
     modelId: String,
 ): Pair<String, String> {
-    val provider = ProviderCatalog.byId(providerId) ?: ProviderCatalog.default
-    val model = provider.models.firstOrNull { it.id == modelId } ?: provider.defaultModel
-    return provider.id to model.id
+    val provider = ProviderCatalog.byId(providerId)
+        ?: return ProviderCatalog.default.id to ProviderCatalog.default.defaultModel.id
+    val trimmedModel = modelId.trim()
+    if (trimmedModel.isBlank()) {
+        return provider.id to provider.defaultModel.id
+    }
+    val catalogMatch = provider.models.firstOrNull { it.id == trimmedModel }
+    if (catalogMatch != null) {
+        return provider.id to catalogMatch.id
+    }
+    // If the stored model ID belongs to a DIFFERENT catalog provider (e.g. user
+    // just switched providers), snap to the new provider's default model.
+    val belongsToOtherProvider = ProviderCatalog.all.any { other ->
+        other.id != provider.id && other.models.any { it.id == trimmedModel }
+    }
+    if (belongsToOtherProvider) {
+        return provider.id to provider.defaultModel.id
+    }
+    // Otherwise treat it as a user-specified custom model ID for this provider.
+    return provider.id to trimmedModel
 }

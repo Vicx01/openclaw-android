@@ -235,11 +235,17 @@ class NodeProcess @Inject constructor(
             val models = cfg.optJSONObject("models")
                 ?: org.json.JSONObject().also { cfg.put("models", it) }
             val providers = org.json.JSONObject()
-            for (p in com.crsk.openclaw.data.providers.ProviderCatalog.all) {
+            val catalog = com.crsk.openclaw.data.providers.ProviderCatalog
+            val activeProvider = catalog.byId(preferences.apiProvider.value) ?: catalog.default
+            val selectedModelId = preferences.selectedModel.value.trim()
+
+            for (p in catalog.all) {
                 val key = keyStore.getProviderKey(p.id)
                 if (key.isBlank()) continue
+                val effectiveBaseUrl = preferences.getEffectiveBaseUrl(p)
+                val customModelForProvider = preferences.getCustomModel(p.id)
                 providers.put(p.id, org.json.JSONObject().apply {
-                    put("baseUrl", p.baseUrl)
+                    put("baseUrl", effectiveBaseUrl)
                     put("apiKey", key)
                     put("api", "openai-completions")
                     // Pin the embedded "pi" agent harness. openclaw routes
@@ -249,7 +255,9 @@ class NodeProcess @Inject constructor(
                     // providerConfig.agentRuntime.id.
                     put("agentRuntime", org.json.JSONObject().put("id", "pi"))
                     put("models", org.json.JSONArray().apply {
+                        val addedIds = mutableSetOf<String>()
                         p.models.forEach { m ->
+                            addedIds.add(m.id)
                             put(org.json.JSONObject().apply {
                                 put("id", m.id)
                                 put("name", m.displayName)
@@ -258,6 +266,26 @@ class NodeProcess @Inject constructor(
                                 put("contextWindow", m.contextWindow)
                                 put("maxTokens", m.maxTokens)
                             })
+                        }
+                        val extraModels = listOfNotNull(
+                            customModelForProvider.takeIf { it.isNotBlank() },
+                            selectedModelId.takeIf { p.id == activeProvider.id && it.isNotBlank() },
+                        ).distinct()
+                        for (extraId in extraModels) {
+                            val belongsToOther = catalog.all.any { other ->
+                                other.id != p.id && other.models.any { it.id == extraId }
+                            }
+                            if (extraId !in addedIds && !belongsToOther) {
+                                addedIds.add(extraId)
+                                put(org.json.JSONObject().apply {
+                                    put("id", extraId)
+                                    put("name", extraId)
+                                    put("reasoning", false)
+                                    put("input", org.json.JSONArray().put("text"))
+                                    put("contextWindow", 131_072)
+                                    put("maxTokens", 8_192)
+                                })
+                            }
                         }
                     })
                 })
@@ -290,15 +318,15 @@ class NodeProcess @Inject constructor(
             }
             val modelCfg = defaults.optJSONObject("model")
                 ?: org.json.JSONObject().also { defaults.put("model", it) }
-            // Default model = the user's Settings selection. Per-call `model` from
-            // ChatSession still overrides this; the baseline covers non-overriding
-            // pathways (heartbeat, fallback). Falls back to the catalog default
-            // when the stored selection doesn't match the stored provider.
-            val catalog = com.crsk.openclaw.data.providers.ProviderCatalog
-            val provider = catalog.byId(preferences.apiProvider.value) ?: catalog.default
-            val selected = preferences.selectedModel.value
-            val modelId = provider.models.firstOrNull { it.id == selected }?.id
-                ?: provider.defaultModel.id
+            // Default model = the user's Settings selection (including custom model IDs).
+            val provider = activeProvider
+            val belongsToOther = catalog.all.any { other ->
+                other.id != provider.id && other.models.any { it.id == selectedModelId }
+            }
+            val modelId = when {
+                selectedModelId.isNotBlank() && !belongsToOther -> selectedModelId
+                else -> provider.defaultModel.id
+            }
             modelCfg.put("primary", "${provider.id}/$modelId")
             modelCfg.put("fallbacks", org.json.JSONArray())
 
@@ -308,6 +336,13 @@ class NodeProcess @Inject constructor(
                 Log.d("NodeProcess", "Config unchanged (hash=${hash.take(8)}), skipping write")
             } else {
                 cfgFile.writeText(serialised)
+                // Restrict config.json to owner read/write only (0600) since it holds provider API keys.
+                runCatching {
+                    cfgFile.setReadable(false, false)
+                    cfgFile.setReadable(true, true)
+                    cfgFile.setWritable(false, false)
+                    cfgFile.setWritable(true, true)
+                }
                 lastConfigHash = hash
                 Log.i("NodeProcess", "Refreshed config: providers from keystore, primary=${provider.id}/$modelId (hash=${hash.take(8)})")
             }

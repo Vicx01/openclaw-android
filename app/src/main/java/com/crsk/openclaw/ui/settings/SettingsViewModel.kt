@@ -116,6 +116,7 @@ class SettingsViewModel @Inject constructor(
             runCatching { auditLog.clear() }
             runCatching { consentStore.withdrawAll() }
             runCatching { preferences.resetLifetimeTokens() }
+            runCatching { preferences.clearCustomEndpoints() }
             runCatching {
                 java.io.File(appContext.filesDir, "home/.openclaw").deleteRecursively()
             }
@@ -249,16 +250,33 @@ class SettingsViewModel @Inject constructor(
     private val _savedKey = MutableStateFlow(preferences.getProviderKey(selectedProvider.value.id))
     val savedKey: StateFlow<String> = _savedKey.asStateFlow()
 
+    /** Optional custom base URL override for the selected provider. */
+    private val _customBaseUrl = MutableStateFlow(preferences.getCustomBaseUrl(selectedProvider.value.id))
+    val customBaseUrl: StateFlow<String> = _customBaseUrl.asStateFlow()
+
+    /** Custom model ID draft for the selected provider. */
+    private val _customModelDraft = MutableStateFlow(preferences.getCustomModel(selectedProvider.value.id))
+    val customModelDraft: StateFlow<String> = _customModelDraft.asStateFlow()
+
     /** Switch provider: persist the choice, snap the model to that provider's
-     *  default when the stored one doesn't belong to it, and reload the key field. */
+     *  custom or default model when the stored one belongs to a different provider,
+     *  and reload the key / endpoint / custom-model fields. */
     fun setProvider(providerId: String) {
         val provider = ProviderCatalog.byId(providerId) ?: return
         viewModelScope.launch {
             preferences.setApiProvider(provider.id)
-            if (provider.models.none { it.id == preferences.selectedModel.value }) {
-                preferences.setSelectedModel(provider.defaultModel.id)
+            val currentModel = preferences.selectedModel.value
+            val customModel = preferences.getCustomModel(provider.id)
+            val belongsToOther = ProviderCatalog.all.any { other ->
+                other.id != provider.id && other.models.any { it.id == currentModel }
+            }
+            if (currentModel.isBlank() || belongsToOther) {
+                val nextModel = customModel.ifBlank { provider.defaultModel.id }
+                preferences.setSelectedModel(nextModel)
             }
             _savedKey.value = preferences.getProviderKey(provider.id)
+            _customBaseUrl.value = preferences.getCustomBaseUrl(provider.id)
+            _customModelDraft.value = customModel
             _keyEdit.value = KeyEditState(draft = _savedKey.value)
         }
     }
@@ -331,48 +349,163 @@ class SettingsViewModel @Inject constructor(
         _keyEdit.value = _keyEdit.value.copy(draft = text.trim(), message = null, isError = false)
     }
 
-    fun saveKey() {
-        val draft = _keyEdit.value.draft
+    fun customBaseUrlChanged(text: String) {
+        _customBaseUrl.value = text.trim()
+    }
+
+    fun saveCustomBaseUrl() {
         val provider = selectedProvider.value
+        val url = _customBaseUrl.value.trim().trimEnd('/')
+        if (url.isNotBlank() && !url.startsWith("https://") && !url.startsWith("http://")) {
+            _keyEdit.value = _keyEdit.value.copy(
+                message = "Custom endpoint must start with https:// or http://",
+                isError = true,
+            )
+            return
+        }
+        preferences.setCustomBaseUrl(provider.id, url)
+        _customBaseUrl.value = url
+        viewModelScope.launch(Dispatchers.IO) { runCatching { gatewayProcess.restart() } }
+        _keyEdit.value = _keyEdit.value.copy(
+            message = if (url.isBlank()) "Endpoint reset to ${provider.displayName} default."
+            else "Custom endpoint saved. Restarting gateway…",
+            isError = false,
+        )
+    }
+
+    fun customModelDraftChanged(text: String) {
+        _customModelDraft.value = text
+    }
+
+    fun applyCustomModel() {
+        val provider = selectedProvider.value
+        val modelId = _customModelDraft.value.trim()
+        preferences.setCustomModel(provider.id, modelId)
+        viewModelScope.launch {
+            val target = modelId.ifBlank { provider.defaultModel.id }
+            preferences.setSelectedModel(target)
+            withContext(Dispatchers.IO) { runCatching { gatewayProcess.restart() } }
+        }
+    }
+
+    fun saveKey() {
+        val draft = _keyEdit.value.draft.trim()
+        val provider = selectedProvider.value
+        val baseUrlOverride = _customBaseUrl.value.trim().takeIf { it.isNotBlank() }
+        val activeModel = _customModelDraft.value.trim().ifBlank { selectedModel.value }
         if (draft.isBlank()) {
             _keyEdit.value = _keyEdit.value.copy(message = "Paste a key first.", isError = true)
             return
         }
         _keyEdit.value = _keyEdit.value.copy(isValidating = true, message = null, isError = false)
         viewModelScope.launch {
-            _keyEdit.value = when (val result = keyValidator.validate(provider, draft)) {
+            val result = keyValidator.validate(
+                provider = provider,
+                apiKey = draft,
+                baseUrlOverride = baseUrlOverride,
+                modelId = activeModel,
+                verifyModel = false,
+            )
+            _keyEdit.value = when (result) {
                 KeyValidationResult.Valid -> {
                     preferences.setProviderKey(provider.id, draft)
+                    if (baseUrlOverride != null) {
+                        preferences.setCustomBaseUrl(provider.id, baseUrlOverride)
+                    }
                     _savedKey.value = draft
                     // The gateway reads keys at start — restart so openclaw picks
                     // up the new provider without waiting for the next app launch.
                     viewModelScope.launch(Dispatchers.IO) { runCatching { gatewayProcess.restart() } }
-                    KeyEditState(draft = draft, message = "Key updated. Restarting gateway…", isError = false)
+                    KeyEditState(draft = draft, message = "Key verified and saved. Restarting gateway…", isError = false)
                 }
-                KeyValidationResult.InvalidKey ->
-                    _keyEdit.value.copy(
-                        isValidating = false,
-                        message = "That key didn't work.",
-                        isError = true,
-                    )
-                is KeyValidationResult.NetworkError ->
-                    _keyEdit.value.copy(
-                        isValidating = false,
-                        message = "Couldn't reach ${provider.displayName}. Check your connection.",
-                        isError = true,
-                    )
-                is KeyValidationResult.UnexpectedStatus ->
-                    _keyEdit.value.copy(
-                        isValidating = false,
-                        message = "${provider.displayName} returned HTTP ${result.code}.",
-                        isError = true,
-                    )
+                else -> mapValidationErrorState(_keyEdit.value, provider, result)
             }
         }
     }
 
+    fun testConnection() {
+        val provider = selectedProvider.value
+        val keyToTest = _keyEdit.value.draft.trim().ifBlank { _savedKey.value.trim() }
+        val baseUrlOverride = _customBaseUrl.value.trim().takeIf { it.isNotBlank() }
+        val activeModel = _customModelDraft.value.trim().ifBlank { selectedModel.value }
+        if (keyToTest.isBlank()) {
+            _keyEdit.value = _keyEdit.value.copy(message = "Enter or save an API key first.", isError = true)
+            return
+        }
+        _keyEdit.value = _keyEdit.value.copy(isValidating = true, message = null, isError = false)
+        viewModelScope.launch {
+            val result = keyValidator.validate(
+                provider = provider,
+                apiKey = keyToTest,
+                baseUrlOverride = baseUrlOverride,
+                modelId = activeModel,
+                verifyModel = true,
+            )
+            _keyEdit.value = when (result) {
+                KeyValidationResult.Valid -> {
+                    if (keyToTest != _savedKey.value) {
+                        preferences.setProviderKey(provider.id, keyToTest)
+                        _savedKey.value = keyToTest
+                    }
+                    if (_customBaseUrl.value.trim() != preferences.getCustomBaseUrl(provider.id)) {
+                        preferences.setCustomBaseUrl(provider.id, _customBaseUrl.value.trim())
+                    }
+                    viewModelScope.launch(Dispatchers.IO) { runCatching { gatewayProcess.restart() } }
+                    _keyEdit.value.copy(
+                        isValidating = false,
+                        message = "Connection verified (${provider.displayName} · $activeModel).",
+                        isError = false,
+                    )
+                }
+                else -> mapValidationErrorState(_keyEdit.value, provider, result)
+            }
+        }
+    }
+
+    private fun mapValidationErrorState(
+        current: KeyEditState,
+        provider: AiProvider,
+        result: KeyValidationResult,
+    ): KeyEditState = when (result) {
+        KeyValidationResult.Valid -> current.copy(isValidating = false, isError = false)
+        KeyValidationResult.InvalidKey ->
+            current.copy(
+                isValidating = false,
+                message = "Invalid API key for ${provider.displayName}. Check that the key starts with '${provider.keyHint.removeSuffix("…")}' and hasn't been revoked.",
+                isError = true,
+            )
+        is KeyValidationResult.QuotaExceeded ->
+            current.copy(
+                isValidating = false,
+                message = "Quota or rate limit exceeded: ${result.detail}",
+                isError = true,
+            )
+        is KeyValidationResult.UnsupportedModel ->
+            current.copy(
+                isValidating = false,
+                message = "Unsupported model '${result.modelId}': ${result.detail}",
+                isError = true,
+            )
+        is KeyValidationResult.NetworkError ->
+            current.copy(
+                isValidating = false,
+                message = "Network error reaching ${provider.displayName}: ${result.message}",
+                isError = true,
+            )
+        is KeyValidationResult.UnexpectedStatus ->
+            current.copy(
+                isValidating = false,
+                message = "${provider.displayName} returned HTTP ${result.code}" +
+                    (result.detail?.let { ": $it" } ?: "."),
+                isError = true,
+            )
+    }
+
     fun setSelectedModel(modelId: String) {
-        viewModelScope.launch { preferences.setSelectedModel(modelId) }
+        viewModelScope.launch {
+            preferences.setSelectedModel(modelId)
+            withContext(Dispatchers.IO) { runCatching { gatewayProcess.restart() } }
+        }
     }
 
     fun startGateway() {
