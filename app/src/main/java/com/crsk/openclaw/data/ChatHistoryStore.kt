@@ -23,13 +23,10 @@ import javax.inject.Singleton
  * to disk so task history survives Activity recreation and app restarts.
  */
 @Singleton
-class ChatHistoryStore(
-    private val file: File?,
+class ChatHistoryStore @Inject constructor(
+    @ApplicationContext context: Context,
 ) {
-    @Inject
-    constructor(@ApplicationContext context: Context) : this(
-        File(context.filesDir, "chat_history.json"),
-    )
+    private val file: File? = File(context.filesDir, "chat_history.json")
 
     private val mutex = Mutex()
 

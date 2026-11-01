@@ -1,8 +1,9 @@
 name: CI
 on:
   push:
-    branches: [main]
+    branches: [main, "arena/**"]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build:
@@ -23,7 +24,16 @@ jobs:
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
       - name: Build, unit test, lint
-        run: ./gradlew assembleDebug testDebugUnitTest lintDebug --stacktrace
+        run: |
+          set +e
+          ./gradlew assembleDebug testDebugUnitTest lintDebug --stacktrace 2>&1 | tee gradle.log
+          EXIT_CODE=${PIPESTATUS[0]}
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            grep -E "(^e: |FAILURE:|> Task .* FAILED|Exception|Error)" gradle.log | tail -n 30 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit "$EXIT_CODE"
+          fi
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         if: success()
