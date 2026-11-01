@@ -22,6 +22,45 @@ object UiObserveRenderer {
     private const val JPEG_QUALITY = 70
     private const val BOX_STROKE = 4f
     private const val BADGE_PADDING = 6f
+    private const val MAX_LEGEND_TEXT_CHARS = 120
+    private const val MAX_VISIBLE_TEXT_ITEMS = 35
+    private const val MAX_VISIBLE_TEXT_CHARS = 240
+
+    /**
+     * Extracts visible, non-occluded text content from the full accessibility tree (such as
+     * webpage paragraphs, article headings, settings descriptions, and chat messages) that
+     * are not already represented as interactive marks in [marks].
+     */
+    fun extractVisibleTexts(
+        nodes: List<ElementNode>,
+        marks: List<ElementNode> = emptyList(),
+        maxItems: Int = MAX_VISIBLE_TEXT_ITEMS,
+        maxCharsPerItem: Int = MAX_VISIBLE_TEXT_CHARS,
+    ): List<String> {
+        val markTexts = marks.mapNotNull { m ->
+            m.displayText.trim().take(MAX_LEGEND_TEXT_CHARS).takeIf { it.isNotEmpty() }
+        }.toSet()
+        val seen = LinkedHashSet<String>()
+
+        fun walk(list: List<ElementNode>) {
+            for (n in list) {
+                if (!n.occluded) {
+                    val primary = n.text.trim().ifEmpty { n.contentDescription.trim() }
+                    if (primary.isNotEmpty()) {
+                        val cleaned = primary.replace(Regex("\\s+"), " ").take(maxCharsPerItem)
+                        if (cleaned.isNotEmpty() && cleaned !in markTexts) {
+                            seen.add(cleaned)
+                        }
+                    }
+                }
+                if (seen.size >= maxItems) return
+                walk(n.children)
+                if (seen.size >= maxItems) return
+            }
+        }
+        walk(nodes)
+        return seen.take(maxItems)
+    }
 
     /**
      * Text-only legend. Cheap — no screenshot bytes. Returned by every /agent/act call
@@ -33,6 +72,7 @@ object UiObserveRenderer {
         activity: String,
         keyboardVisible: Boolean,
         focusedMarkId: Int?,
+        nodes: List<ElementNode> = emptyList(),
     ): JSONObject {
         val legend = JSONArray()
         marks.forEach { n ->
@@ -40,11 +80,13 @@ object UiObserveRenderer {
                 put("id", n.markId)
                 put("role", n.className.substringAfterLast('.'))
                 val display = n.displayText
-                if (display.isNotEmpty()) put("text", display.take(40))
+                if (display.isNotEmpty()) put("text", display.take(MAX_LEGEND_TEXT_CHARS))
                 if (n.isEditable) put("edit", true)
                 if (n.isScrollable) put("scroll", true)
+                if (n.isChecked != null) put("checked", n.isChecked)
             })
         }
+        val visibleTexts = if (nodes.isNotEmpty()) extractVisibleTexts(nodes, marks) else emptyList()
         return JSONObject().apply {
             put("ok", true)
             put("pkg", pkg)
@@ -53,6 +95,9 @@ object UiObserveRenderer {
             put("keyboardVisible", keyboardVisible)
             if (focusedMarkId != null) put("focused", focusedMarkId)
             put("legend", legend)
+            if (visibleTexts.isNotEmpty()) {
+                put("texts", JSONArray().apply { visibleTexts.forEach { put(it) } })
+            }
         }
     }
 
@@ -70,6 +115,7 @@ object UiObserveRenderer {
         activity: String,
         keyboardVisible: Boolean,
         focusedMarkId: Int?,
+        nodes: List<ElementNode> = emptyList(),
     ): JSONObject {
         // Hardware-backed bitmaps from AccessibilityService.takeScreenshot are read-only;
         // copy to a mutable ARGB_8888 surface we can draw on.
@@ -103,9 +149,10 @@ object UiObserveRenderer {
                 put("id", n.markId)
                 put("role", n.className.substringAfterLast('.'))
                 val display = n.displayText
-                if (display.isNotEmpty()) put("text", display.take(40))
+                if (display.isNotEmpty()) put("text", display.take(MAX_LEGEND_TEXT_CHARS))
                 if (n.isEditable) put("edit", true)
                 if (n.isScrollable) put("scroll", true)
+                if (n.isChecked != null) put("checked", n.isChecked)
             })
         }
 
@@ -116,6 +163,7 @@ object UiObserveRenderer {
         if (scaled !== mutable) scaled.recycle()
         mutable.recycle()
 
+        val visibleTexts = if (nodes.isNotEmpty()) extractVisibleTexts(nodes, marks) else emptyList()
         return JSONObject().apply {
             put("ok", true)
             put("pkg", pkg)
@@ -125,6 +173,9 @@ object UiObserveRenderer {
             put("keyboardVisible", keyboardVisible)
             if (focusedMarkId != null) put("focused", focusedMarkId)
             put("legend", legend)
+            if (visibleTexts.isNotEmpty()) {
+                put("texts", JSONArray().apply { visibleTexts.forEach { put(it) } })
+            }
             put("screenshot_jpeg", b64)
             put("format", "jpeg")
         }
