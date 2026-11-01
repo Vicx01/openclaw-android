@@ -22,6 +22,7 @@ import dagger.hilt.InstallIn
 import dagger.hilt.android.EntryPointAccessors
 import dagger.hilt.components.SingletonComponent
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
@@ -34,9 +35,17 @@ class PhoneAccessibilityService : AccessibilityService() {
     @InstallIn(SingletonComponent::class)
     interface A11yEntryPoint {
         fun holder(): AccessibilityServiceHolder
+        fun overlayBridge(): com.crsk.openclaw.overlay.AgentOverlayBridge
+        fun taskGate(): TaskExecutionGate
     }
 
     private lateinit var holder: AccessibilityServiceHolder
+    private var overlayBridge: com.crsk.openclaw.overlay.AgentOverlayBridge? = null
+    private var taskGate: TaskExecutionGate? = null
+    private var approvalCollectJob: kotlinx.coroutines.Job? = null
+    private val serviceScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main,
+    )
 
     private val cachedSnapshot = AtomicReference<UiSnapshot?>(null)
     private val lastRefresh = AtomicLong(0L)
@@ -55,11 +64,33 @@ class PhoneAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        holder = EntryPointAccessors.fromApplication(application, A11yEntryPoint::class.java).holder()
+        val entryPoint = EntryPointAccessors.fromApplication(application, A11yEntryPoint::class.java)
+        holder = entryPoint.holder()
+        overlayBridge = entryPoint.overlayBridge()
+        taskGate = entryPoint.taskGate()
         holder.attach(this)
         visionOverlay = AgentVisionOverlay(this)
         workerThread = HandlerThread("a11y-tree-worker").apply { start() }
         workerHandler = Handler(workerThread!!.looper)
+        approvalCollectJob = serviceScope.launch {
+            overlayBridge?.overlayState?.collect { st ->
+                val req = st.pendingApproval
+                if (req != null) {
+                    visionOverlay?.showApprovalBanner(
+                        request = req,
+                        onAllow = { overlayBridge?.submitApprovalDecision(true) },
+                        onDeny = { overlayBridge?.submitApprovalDecision(false) },
+                        onStop = {
+                            taskGate?.cancelTurn("Stopped by user")
+                            overlayBridge?.submitApprovalDecision(false)
+                            overlayBridge?.requestStop()
+                        },
+                    )
+                } else {
+                    visionOverlay?.hideApprovalBanner()
+                }
+            }
+        }
         Log.i(TAG, "onServiceConnected — UI automation active")
         scheduleRefresh()
     }
@@ -123,6 +154,8 @@ class PhoneAccessibilityService : AccessibilityService() {
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
+        approvalCollectJob?.cancel()
+        approvalCollectJob = null
         holder.detach()
         visionOverlay?.hide(); visionOverlay = null
         cachedSnapshot.set(null)
@@ -192,24 +225,119 @@ class PhoneAccessibilityService : AccessibilityService() {
     fun performRecents(): Boolean = performGlobalAction(GLOBAL_ACTION_RECENTS)
     fun performNotifications(): Boolean = performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
 
-    fun setTextOnFocused(text: String): Boolean {
+    /**
+     * Attempts a semantic AccessibilityNodeInfo.ACTION_CLICK on the clickable node matching
+     * [targetBounds] (or the deepest clickable node containing its center point). Returns
+     * false if no clickable node matches or ACTION_CLICK is rejected, allowing the caller to
+     * fall back to [dispatchTap].
+     */
+    fun performSemanticClick(targetBounds: IntBox): Boolean {
         val root = rootInActiveWindow ?: return false
-        val focused = findFocusedEditable(root)
-        if (focused != null) {
-            val args = android.os.Bundle().apply {
-                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        return try {
+            val node = findNodeForClick(root, targetBounds) ?: return false
+            val ok = try {
+                node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            } finally {
+                try { node.recycle() } catch (_: Exception) {}
             }
-            val result = focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-            try { focused.recycle() } catch (_: Exception) {}
+            ok
+        } catch (_: Exception) {
+            false
+        } finally {
             try { root.recycle() } catch (_: Exception) {}
-            return result
         }
-        try { root.recycle() } catch (_: Exception) {}
-        return false
+    }
+
+    private fun findNodeForClick(root: AccessibilityNodeInfo, targetBounds: IntBox): AccessibilityNodeInfo? {
+        val cx = targetBounds.centerX
+        val cy = targetBounds.centerY
+        var bestMatch: AccessibilityNodeInfo? = null
+        var bestArea = Int.MAX_VALUE
+
+        fun walk(node: AccessibilityNodeInfo) {
+            val r = Rect()
+            node.getBoundsInScreen(r)
+            if (r.contains(cx, cy)) {
+                val exactMatch = r.left == targetBounds.left &&
+                    r.top == targetBounds.top &&
+                    r.right == targetBounds.right &&
+                    r.bottom == targetBounds.bottom
+                if (node.isClickable) {
+                    val area = (r.width().coerceAtLeast(1)) * (r.height().coerceAtLeast(1))
+                    if (exactMatch || area <= bestArea) {
+                        try { bestMatch?.recycle() } catch (_: Exception) {}
+                        bestMatch = AccessibilityNodeInfo.obtain(node)
+                        bestArea = if (exactMatch) 0 else area
+                    }
+                }
+            }
+            for (i in 0 until node.childCount) {
+                val child = try { node.getChild(i) } catch (_: Exception) { null } ?: continue
+                walk(child)
+                try { child.recycle() } catch (_: Exception) {}
+            }
+        }
+
+        walk(root)
+        return bestMatch
+    }
+
+    fun setTextOnFocused(text: String, targetBounds: IntBox? = null): Boolean {
+        val root = rootInActiveWindow ?: return false
+        try {
+            var editable = findFocusedEditable(root)
+            if (editable == null && targetBounds != null) {
+                editable = findEditableAtBounds(root, targetBounds)
+                if (editable != null) {
+                    runCatching { editable.performAction(AccessibilityNodeInfo.ACTION_FOCUS) }
+                    runCatching { editable.performAction(AccessibilityNodeInfo.ACTION_CLICK) }
+                }
+            }
+            if (editable != null) {
+                try {
+                    val args = android.os.Bundle().apply {
+                        putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                    }
+                    if (editable.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                        return true
+                    }
+                    // Fallback: Clipboard paste via ACTION_PASTE (works on custom EditTexts/WebViews without Shizuku)
+                    val previousClip = getClipboard()
+                    setClipboard(text)
+                    val pasted = editable.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+                    if (!previousClip.isNullOrEmpty()) {
+                        workerHandler?.postDelayed({ runCatching { setClipboard(previousClip) } }, 500L)
+                    }
+                    if (pasted) return true
+                } finally {
+                    try { editable.recycle() } catch (_: Exception) {}
+                }
+            }
+            return false
+        } finally {
+            try { root.recycle() } catch (_: Exception) {}
+        }
+    }
+
+    fun performImeEnter(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+        val root = rootInActiveWindow ?: return false
+        return try {
+            val focused = findFocusedEditable(root) ?: return false
+            try {
+                focused.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+            } finally {
+                try { focused.recycle() } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {
+            false
+        } finally {
+            try { root.recycle() } catch (_: Exception) {}
+        }
     }
 
     private fun findFocusedEditable(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        if (node.isFocused && (node.isEditable || node.className?.toString()?.contains("EditText") == true)) {
+        if (node.isFocused && isNodeEditable(node)) {
             return AccessibilityNodeInfo.obtain(node)
         }
         for (i in 0 until node.childCount) {
@@ -219,6 +347,28 @@ class PhoneAccessibilityService : AccessibilityService() {
             if (found != null) return found
         }
         return null
+    }
+
+    private fun findEditableAtBounds(node: AccessibilityNodeInfo, targetBounds: IntBox): AccessibilityNodeInfo? {
+        val r = Rect()
+        node.getBoundsInScreen(r)
+        if (r.contains(targetBounds.centerX, targetBounds.centerY) && isNodeEditable(node)) {
+            return AccessibilityNodeInfo.obtain(node)
+        }
+        for (i in 0 until node.childCount) {
+            val child = try { node.getChild(i) } catch (_: Exception) { null } ?: continue
+            val found = findEditableAtBounds(child, targetBounds)
+            try { child.recycle() } catch (_: Exception) {}
+            if (found != null) return found
+        }
+        return null
+    }
+
+    private fun isNodeEditable(node: AccessibilityNodeInfo): Boolean {
+        val cls = node.className?.toString().orEmpty()
+        return node.isEditable ||
+            cls.contains("EditText", ignoreCase = true) ||
+            cls.contains("AutoComplete", ignoreCase = true)
     }
 
     private suspend fun dispatchAndAwait(gesture: GestureDescription): Boolean {

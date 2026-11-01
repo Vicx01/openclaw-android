@@ -88,6 +88,7 @@ open class WsRpcClient @Inject constructor(
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.w(TAG, "ws closed code=$code reason=$reason")
                 connected = false
+                failPendingAndEmitDisconnect("WebSocket closed ($code: $reason)")
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -95,6 +96,7 @@ open class WsRpcClient @Inject constructor(
                 connected = false
                 if (!challenge.isCompleted) challenge.completeExceptionally(t)
                 if (!helloOk.isCompleted) helloOk.completeExceptionally(t)
+                failPendingAndEmitDisconnect(t.message ?: "WebSocket connection failure")
             }
         })
 
@@ -146,6 +148,29 @@ open class WsRpcClient @Inject constructor(
         res.payload?.optJSONObject("policy")?.optLong("tickIntervalMs")?.takeIf { it > 0 }
             ?.let { tickIntervalMs = it }
         Log.i(TAG, "hello-ok protocol=${res.payload?.optInt("protocol")} tickInterval=${tickIntervalMs}ms")
+    }
+
+    private fun failPendingAndEmitDisconnect(reason: String) {
+        val iterator = pending.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            iterator.remove()
+            entry.value.complete(
+                Frame.Response(
+                    id = entry.key,
+                    ok = false,
+                    payload = null,
+                    error = Frame.Error("WS_DISCONNECTED", reason, null),
+                ),
+            )
+        }
+        _events.tryEmit(
+            Frame.Event(
+                event = "ws.disconnected",
+                payload = JSONObject().put("reason", reason),
+                seq = null,
+            ),
+        )
     }
 
     override suspend fun call(method: String, params: JSONObject, timeoutMs: Long): Frame.Response = doCall(method, params, timeoutMs)
