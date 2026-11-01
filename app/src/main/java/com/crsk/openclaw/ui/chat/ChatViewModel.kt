@@ -180,7 +180,7 @@ class ChatViewModel @Inject constructor(
 
         val providerIdPref = preferences.apiProvider.value
         val provider = ProviderCatalog.byId(providerIdPref) ?: ProviderCatalog.default
-        if (preferences.getApiKey(provider.id).isBlank()) {
+        if (preferences.getProviderKey(provider.id).isBlank()) {
             _state.value = _state.value.copy(
                 error = "No API key configured for ${provider.displayName}. Open Settings to enter and test your API key.",
             )
