@@ -261,7 +261,7 @@ class UiRoutes @Inject constructor(
         if (cached != null && now - lastTreeResponseMs < TREE_MIN_INTERVAL_MS && cached.startsWith(cacheKey)) {
             return NanoHTTPD.newFixedLengthResponse(
                 Response.Status.OK, "application/json",
-                cached.substringAfter(' '),
+                cached.substringAfter('\n'),
             )
         }
 
@@ -278,7 +278,7 @@ class UiRoutes @Inject constructor(
             put("nodes", JSONArray().apply { filtered.forEach { put(it.toCompactJson()) } })
         }.toString()
 
-        lastTreeResponse = "$cacheKey $body"
+        lastTreeResponse = "$cacheKey\n$body"
         lastTreeResponseMs = now
         return NanoHTTPD.newFixedLengthResponse(Response.Status.OK, "application/json", body)
     }
